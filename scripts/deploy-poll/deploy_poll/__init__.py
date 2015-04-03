@@ -18,7 +18,7 @@ logger = logging.getLogger('deploy-poll')
 
 
 class DeployPoll(object):
-    def __init__(self, queue_url, interval=1):
+    def __init__(self, queue_url, interval):
         self.interval = interval
         self.q = self.sqs_setup(queue_url)
         self.message_count=0
@@ -33,7 +33,7 @@ class DeployPoll(object):
 
     def poll_queue(self):
         while True:
-            logger.debug("Waiting for messages for " + self.interval + "s, completed " + str(self.message_count) + " so far.")
+            logger.debug("Waiting for messages for " + str(self.interval) + "s, completed " + str(self.message_count) + " so far.")
             messages = self.q.get_messages(1, attributes='SentTimestamp', message_attributes=['SenderIp', 'Playbook'], wait_time_seconds=self.interval)
             if len(messages) > 0:
                 message = messages.pop()
@@ -67,7 +67,7 @@ class DeployPoll(object):
         # if the message explicitly does not state a playbook in the attributes.
 	try:
             message_playbook = message.message_attributes['Playbook']['string_value']
-	    location = config.ANSIBLE_PLAYBOOKS + "/{}".format(message_playbook)
+	    location = config.ANSIBLE_PLAYBOOK_DIRECTORY + "/{}".format(message_playbook)
 
 	    if not os.path.isfile(location):
               errors.append("No playbook found at " + location)
@@ -111,13 +111,13 @@ class DeployPoll(object):
         logger.info("Deploying {}".format(",".join(["{}={}".format(k, v) for k, v in payload.items()])))
         ansible_runtime_vars = " ".join(["-e {}={}".format(k, v) for k, v in payload.items()])
         playbook_cmd = [
-            "ansible-playbook",
+            config.ANSIBLE_PLAYBOOK_COMMAND,
             "--private-key",
             config.PRIVATE_KEY_FILE,
             "-i",
             "{},".format(sender),
             ansible_runtime_vars,
-            config.ANSIBLE_PLAYBOOKS + "/{}".format(playbook)
+            config.ANSIBLE_PLAYBOOK_DIRECTORY + "/{}".format(playbook)
         ]
         logger.debug("Ansible playbook command: {0}".format(' '.join(playbook_cmd)))
 	self.message_count += 1
