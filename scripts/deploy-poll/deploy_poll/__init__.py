@@ -12,6 +12,7 @@ import boto.sqs.queue
 import boto.exception
 
 import config
+import os
 
 logger = logging.getLogger('deploy-poll')
 
@@ -20,6 +21,7 @@ class DeployPoll(object):
     def __init__(self, queue_url, interval=1):
         self.interval = interval
         self.q = self.sqs_setup(queue_url)
+        self.message_count=0
 
     def sqs_setup(self, queue_url):
         try:
@@ -31,34 +33,51 @@ class DeployPoll(object):
 
     def poll_queue(self):
         while True:
-            messages = self.q.get_messages(1, attributes='SentTimestamp', message_attributes=['SenderIp'])
+            logger.debug("Waiting for messages for " + self.interval + "s, completed " + str(self.message_count) + " so far.")
+            messages = self.q.get_messages(1, attributes='SentTimestamp', message_attributes=['SenderIp', 'Playbook'], wait_time_seconds=self.interval)
             if len(messages) > 0:
                 message = messages.pop()
                 logger.debug("Found new message!")
-                (payload, sender) = self.check_object(message)
-                if payload is not None and sender is not None:
-                    self.fork_ansible_playbook(payload, sender)
+                (payload, sender, playbook) = self.check_object(message)
+                if payload is not None and sender is not None and playbook is not None:
+                    self.fork_ansible_playbook(payload, sender, playbook)
                 self.delete(message)
 
     def delete(self, message):
         self.q.delete_message(message)
 
     def check_object(self, message):
+
+	# Define the container for the error messages.
+	errors = [];
+
+        # We expect a timestamp from the message. Without one, it's not valid.
         try:
             message_sent = datetime.datetime.fromtimestamp(int(message.attributes['SentTimestamp'])/1000)
         except KeyError:
-            logger.warn("Error reading message timestamp. Discarding this message.")
-            self.delete(message)
-            return (None, None)
+            errors.append("Error reading message timestamp. Discarding this message.")
 
+	# We need the IP of the Sender so we know which box to configure!
         try:
             message_sender = message.message_attributes['SenderIp']['string_value']
         except KeyError:
-            logger.warn("SQS message missing SenderIp")
-            self.delete(message)
-            return (None, None)
+            errors.append("SQS message missing SenderIp")
 
-        message_body = message.get_body()
+	# This will allow us to specify a playbook, or revert to the default
+        # if the message explicitly does not state a playbook in the attributes.
+	try:
+            message_playbook = message.message_attributes['Playbook']['string_value']
+	    location = config.ANSIBLE_PLAYBOOKS + "/{}".format(message_playbook)
+
+	    if not os.path.isfile(location):
+              errors.append("No playbook found at " + location)
+
+        except KeyError:
+ 	    logger.debug("SQS message missing Playbook attribute, using default playbook.")
+            message_playbook = config.ANSIBLE_PLAYBOOK_DEFAULT
+
+	# Load the message body into a JSON object and print in in debug.	 
+	message_body = message.get_body()
 
         logger.debug("Message details - timestamp: {}, ip: {}, contents: {}".format(
             message_sent.strftime("%Y-%m-%d %H:%M:%S"),
@@ -68,23 +87,27 @@ class DeployPoll(object):
         try:
             message_json = json.loads(message_body)
         except ValueError:
-            logger.warn("Unable to deserialize JSON. Discarding.")
-            self.delete(message)
-            return
+            errors.append("Unable to deserialize JSON. Discarding.")
 
-        if datetime.datetime.now() - datetime.timedelta(minutes=1) > message_sent:
-            logger.warn("Message is older than 60 seconds. Assuming it's no longer relevant and discarding")
-            self.delete(message)
-            return
+	# Check if the message is older than the configured acceptable time.
+        if datetime.datetime.now() - datetime.timedelta(seconds=config.MESSAGE_TIMEOUT) > message_sent:
+            errors.append("Message is older than " + str(config.MESSAGE_TIMEOUT) + " seconds. Assuming it's no longer relevant and discarding")
 
         for k in config.REQUIRED_PARAMETERS:
             if not k in message_json:
-                logger.warn("Message missing required parameter {}. Discarding".format(k))
-                return
+                errors.append("Message missing required parameter {}. Discarding".format(k))
+	
+	# So now we know all the problems with the message, let's print them and return.
+	if len(errors) > 0:
+	  for error in errors:
+            logger.warn(error)
 
-        return message_json, message_sender
+	  self.delete(message)
+          return (None, None, None)
+	else:
+          return message_json, message_sender, message_playbook
 
-    def fork_ansible_playbook(self, payload, sender):
+    def fork_ansible_playbook(self, payload, sender, playbook):
         logger.info("Deploying {}".format(",".join(["{}={}".format(k, v) for k, v in payload.items()])))
         ansible_runtime_vars = " ".join(["-e {}={}".format(k, v) for k, v in payload.items()])
         playbook_cmd = [
@@ -94,7 +117,8 @@ class DeployPoll(object):
             "-i",
             "{},".format(sender),
             ansible_runtime_vars,
-            config.ANSIBLE_PLAYBOOKS + "/site.yml"
+            config.ANSIBLE_PLAYBOOKS + "/{}".format(playbook)
         ]
         logger.debug("Ansible playbook command: {0}".format(' '.join(playbook_cmd)))
+	self.message_count += 1
         subprocess.Popen(playbook_cmd)
