@@ -16,12 +16,14 @@ import os
 
 logger = logging.getLogger('deploy-poll')
 
-
 class DeployPoll(object):
-    def __init__(self, queue_url, interval):
+    def __init__(self, q_url, dlq_url, interval):
         self.interval = interval
-        self.q = self.sqs_setup(queue_url)
+        self.q = self.sqs_setup(q_url)
+        self.dlq = self.sqs_setup(dlq_url)
         self.message_count=0
+        self.message_ok=0
+        self.message_failed=0
 
     def sqs_setup(self, queue_url):
         try:
@@ -33,15 +35,13 @@ class DeployPoll(object):
 
     def poll_queue(self):
         while True:
-            logger.debug("Waiting for messages for " + str(self.interval) + "s, completed " + str(self.message_count) + " so far.")
+            logger.debug("Waiting for messages for " + str(self.interval) + "s. Completed " + str(self.message_ok) + "/" + str(self.message_count) + " so far.")
             messages = self.q.get_messages(1, attributes='SentTimestamp', message_attributes=['SenderIp', 'Playbook'], wait_time_seconds=self.interval)
+            
             if len(messages) > 0:
                 message = messages.pop()
                 logger.debug("Found new message!")
-                (payload, sender, playbook) = self.check_object(message)
-                if payload is not None and sender is not None and playbook is not None:
-                    self.fork_ansible_playbook(payload, sender, playbook)
-                self.delete(message)
+                self.fork_ansible_playbook(message)
 
     def delete(self, message):
         self.q.delete_message(message)
@@ -107,18 +107,41 @@ class DeployPoll(object):
 	else:
           return message_json, message_sender, message_playbook
 
-    def fork_ansible_playbook(self, payload, sender, playbook):
-        logger.info("Deploying {}".format(",".join(["{}={}".format(k, v) for k, v in payload.items()])))
-        ansible_runtime_vars = " ".join(["-e {}={}".format(k, v) for k, v in payload.items()])
-        playbook_cmd = [
-            config.ANSIBLE_PLAYBOOK_COMMAND,
-            "--private-key",
-            config.PRIVATE_KEY_FILE,
-            "-i",
-            "{},".format(sender),
-            ansible_runtime_vars,
-            config.ANSIBLE_PLAYBOOK_DIRECTORY + "/{}".format(playbook)
-        ]
-        logger.debug("Ansible playbook command: {0}".format(' '.join(playbook_cmd)))
+    def fork_ansible_playbook(self, message):
+	
+	# Count the messages as they come in.
 	self.message_count += 1
-        subprocess.Popen(playbook_cmd)
+	
+	# Confirm the message is valid.
+        (payload, sender, playbook) = self.check_object(message)
+
+	# If it is and we have the right information within it...
+        if payload is not None and sender is not None and playbook is not None:
+
+            logger.info("Deploying {}".format(",".join(["{}={}".format(k, v) for k, v in payload.items()])))
+            ansible_runtime_vars = " ".join(["-e {}={}".format(k, v) for k, v in payload.items()])
+            playbook_cmd = [
+                config.ANSIBLE_PLAYBOOK_COMMAND,
+                "--private-key",
+                config.PRIVATE_KEY_FILE,
+                "-i",
+                "{},".format(sender),
+                ansible_runtime_vars,
+                config.ANSIBLE_PLAYBOOK_DIRECTORY + "/{}".format(playbook)
+            ]
+            logger.debug("Ansible playbook command: {0}".format(' '.join(playbook_cmd)))
+
+	    # We want to attempt to run the process, but if it fails we have to tell someone.
+	    # We will log that the command has failed.
+            # We'll also attempt to put the message onto a deadletter queue if we can't action it.   
+            process = subprocess.Popen(playbook_cmd)
+            process.wait()
+            if process.returncode > 0:
+                logger.warn("Message is broken, putting on DLQ for further analysis.")      
+                self.dlq.write(message)
+                self.message_failed += 1
+            else:
+                self.message_ok += 1
+
+	    # Finally, delete the message!
+	    self.delete(message)

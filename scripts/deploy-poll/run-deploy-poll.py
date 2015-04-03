@@ -30,21 +30,23 @@ def check_interval(value):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='poll for new deployment requests')
-    parser.add_argument('-q', '--queue-url',
+    parser.add_argument('--queue-url', '-q',
                         required=True,
                         help='URL for SQS queue to check for deploy objects')
-    parser.add_argument('-i', '--interval',
+    parser.add_argument('--dead_letter_queue_url', '-l',
+                        required=True,
+                        help='URL for SQS queue where bad messages are sent.')
+    parser.add_argument('--interval', '-i',
                         required=False,
                         type=check_interval,
                         default=20,
                         help='Polling interval')
-    parser.add_argument('-d', '--debug',
+    parser.add_argument('--debug', '-d',
                         action='store_true',
                         default=False,
                         help='Enable debug logging')
+
     args = parser.parse_args()
-    queue_url = args.queue_url
-    interval = args.interval
 
     # Set up logging
     logger = logging.getLogger('deploy-poll')
@@ -53,5 +55,5 @@ if __name__ == '__main__':
     logger.info("Starting up {}".format(os.path.basename(__file__)))
     logger.debug("Args: queue_url: {0}, interval: {1}".format(args.queue_url, args.interval))
 
-    dp = deploy_poll.DeployPoll(queue_url, interval)
+    dp = deploy_poll.DeployPoll(args.queue_url, args.dead_letter_queue_url, args.interval)
     dp.poll_queue()
